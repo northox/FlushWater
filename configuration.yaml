@@ -1,0 +1,250 @@
+# =====================================================================
+#  Home Assistant configuration - irrigation excerpt
+#
+#  Merge these blocks into your own configuration.yaml. If you already
+#  have an `mqtt:`, `template:` or `automation:` key, append to it
+#  rather than adding a second one - duplicate top-level keys are a
+#  YAML error.
+#
+#  Nothing here contains credentials. The MQTT broker connection
+#  (host / username / password) is set up through the UI in
+#  Settings > Devices & Services > MQTT, not in this file.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+#  Zone switches
+#
+#  command_topic is what the ESP subscribes to.
+#  state_topic is what the ESP is expected to publish back (retained).
+#  If your firmware does not publish status yet, the switches will sit
+#  at "unknown" until it does - see the README.
+# ---------------------------------------------------------------------
+mqtt:
+  switch:
+    - name: "Irrigation Zone 0"
+      unique_id: irrigation_zone_0
+      command_topic: "irrigation/control0"
+      state_topic: "irrigation/status0"
+      payload_on: "on"
+      payload_off: "off"
+      state_on: "on"
+      state_off: "off"
+      qos: 1
+      retain: true
+
+    - name: "Irrigation Zone 1"
+      unique_id: irrigation_zone_1
+      command_topic: "irrigation/control1"
+      state_topic: "irrigation/status1"
+      payload_on: "on"
+      payload_off: "off"
+      state_on: "on"
+      state_off: "off"
+      qos: 1
+      retain: true
+
+    - name: "Irrigation Zone 2"
+      unique_id: irrigation_zone_2
+      command_topic: "irrigation/control2"
+      state_topic: "irrigation/status2"
+      payload_on: "on"
+      payload_off: "off"
+      state_on: "on"
+      state_off: "off"
+      qos: 1
+      retain: true
+
+# ---------------------------------------------------------------------
+#  Which zone is running.
+#  This is the single control surface: the dashboard and the schedule
+#  both set it, and one automation below translates it into switches.
+#  Rename the options to match your own garden.
+# ---------------------------------------------------------------------
+input_select:
+  irrigation_zone:
+    name: Irrigation Zone
+    options: [None, Car side, House front, Street corner]
+    initial: None
+
+# ---------------------------------------------------------------------
+#  Rain probability, from the OpenWeatherMap daily forecast.
+#
+#  Add the OpenWeatherMap integration through the UI first
+#  (Settings > Devices & Services > Add integration > OpenWeatherMap);
+#  it will ask for your API key, which stays out of this file.
+#
+#  Note: Met.no does NOT expose precipitation_probability, only
+#  precipitation in mm - which is why this uses OpenWeatherMap.
+# ---------------------------------------------------------------------
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/30"
+    action:
+      - service: weather.get_forecasts
+        target:
+          entity_id: weather.openweathermap
+        data:
+          type: daily
+        response_variable: fc
+    sensor:
+      - name: "Rain Probability"
+        unique_id: rain_probability
+        unit_of_measurement: "%"
+        state: >
+          {{ fc['weather.openweathermap'].forecast[0].precipitation_probability
+             | default(0) | round(0) }}
+
+automation:
+  # -------------------------------------------------------------------
+  #  Translate the selector into valves, and guarantee that only one
+  #  zone is ever open. Selecting "None" closes everything.
+  # -------------------------------------------------------------------
+  - id: irrigation_select_exclusive
+    alias: Irrigation select exclusive
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.irrigation_zone
+    action:
+      - service: homeassistant.turn_off
+        target:
+          entity_id:
+            - switch.irrigation_zone_0
+            - switch.irrigation_zone_1
+            - switch.irrigation_zone_2
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ states('input_select.irrigation_zone') == 'Car side' }}"
+            sequence:
+              - service: homeassistant.turn_on
+                target: { entity_id: switch.irrigation_zone_0 }
+          - conditions:
+              - condition: template
+                value_template: "{{ states('input_select.irrigation_zone') == 'House front' }}"
+            sequence:
+              - service: homeassistant.turn_on
+                target: { entity_id: switch.irrigation_zone_1 }
+          - conditions:
+              - condition: template
+                value_template: "{{ states('input_select.irrigation_zone') == 'Street corner' }}"
+            sequence:
+              - service: homeassistant.turn_on
+                target: { entity_id: switch.irrigation_zone_2 }
+
+  ############################################################
+  #  Watering schedule
+  #    House front   (zone 1)  Tue, Thu, Sat   02:11 -> 02:48
+  #    Car side      (zone 0)  Tue, Sat        02:48 -> 03:35
+  #    Street corner (zone 2)  Tue, Sat        03:35 -> 05:20
+  #
+  #  These set input_select.irrigation_zone; the "Irrigation
+  #  select exclusive" automation above performs the actual
+  #  valve switching, so the dashboard always shows the zone
+  #  that is really running. Watering is skipped when rain
+  #  probability is 50% or more.
+  ############################################################
+  - id: irrigation_0211_house_front_start
+    alias: "Irrigation 02:11 - House front start"
+    mode: single
+    trigger:
+      - platform: time
+        at: "02:11:00"
+    condition:
+      - condition: time
+        weekday: [tue, thu, sat]
+      - condition: numeric_state
+        entity_id: sensor.rain_probability
+        below: 50
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.irrigation_zone
+        data:
+          option: "House front"
+
+  - id: irrigation_0248_house_front_to_car_side
+    alias: "Irrigation 02:48 - House front off, Car side start"
+    mode: single
+    trigger:
+      - platform: time
+        at: "02:48:00"
+    condition:
+      - condition: time
+        weekday: [tue, thu, sat]
+    action:
+      - choose:
+          # Tue & Sat: hand over to Car side if rain is unlikely
+          - conditions:
+              - condition: time
+                weekday: [tue, sat]
+              - condition: numeric_state
+                entity_id: sensor.rain_probability
+                below: 50
+            sequence:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.irrigation_zone
+                data:
+                  option: "Car side"
+        # Thursday, or rain likely: stop watering for the night
+        default:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.irrigation_zone
+            data:
+              option: "None"
+
+  - id: irrigation_0335_car_side_to_street_corner
+    alias: "Irrigation 03:35 - Car side off, Street corner start"
+    mode: single
+    trigger:
+      - platform: time
+        at: "03:35:00"
+    condition:
+      - condition: time
+        weekday: [tue, sat]
+    action:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: sensor.rain_probability
+                below: 50
+            sequence:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.irrigation_zone
+                data:
+                  option: "Street corner"
+        default:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.irrigation_zone
+            data:
+              option: "None"
+
+  - id: irrigation_0520_all_zones_off
+    alias: "Irrigation 05:20 - All zones off"
+    mode: single
+    trigger:
+      - platform: time
+        at: "05:20:00"
+    condition:
+      - condition: time
+        weekday: [tue, thu, sat]
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.irrigation_zone
+        data:
+          option: "None"
+      # Fail-safe: force every valve closed regardless
+      - service: switch.turn_off
+        target:
+          entity_id:
+            - switch.irrigation_zone_0
+            - switch.irrigation_zone_1
+            - switch.irrigation_zone_2

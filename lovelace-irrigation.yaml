@@ -1,0 +1,17 @@
+# Lovelace card for the irrigation section.
+# Paste into a dashboard via "Add card" > "Manual".
+#
+# The selector is the only control needed: picking a zone opens that
+# valve and closes the others, picking "None" closes everything.
+
+type: entities
+title: Irrigation
+show_header_toggle: false
+entities:
+  - entity: input_select.irrigation_zone
+    name: Active zone
+    icon: mdi:sprinkler-variant
+  - type: divider
+  - entity: sensor.rain_probability
+    name: Rain chance today
+    icon: mdi:weather-rainy
