@@ -1,182 +1,119 @@
-# ESP8266 Irrigation Manager
+# FlushWaterNG
 
-A small MQTT-driven irrigation controller built on an ESP-12F / NodeMCU. It
-drives three valve zones, takes its orders from Home Assistant, and refuses to
-leave a valve open if the network goes away.
+Sump pump controller for the **Seeed XIAO ESP32-C3**. Reads a resistive water
+level sender, decides when the pump may run, and reports to MQTT / Home
+Assistant.
 
-## Key features
+The pump is not driven directly — the relay *inhibits* or *allows* it, so the
+pump's own float switch remains the final authority.
 
-- **MQTT control** - topics `irrigation/control0` / `control1` / `control2`,
-  payloads `on` / `off`.
-- **Authenticated broker connection** - the firmware logs in with a username and
-  password. An anonymous connect is rejected by most brokers.
-- **One zone at a time** - Home Assistant enforces mutual exclusion, so opening
-  one valve always closes the other two.
-- **Weather-aware** - the scheduled runs are skipped when the forecast rain
-  probability is 50% or higher.
-- **30 min auto-off watchdog** - each zone closes itself 30 minutes after it was
-  opened, even if Wi-Fi or MQTT dropped in the meantime.
-- **Wi-Fi auto-reconnect** with exponential backoff, capped at 40 s.
-- **Hardware watchdog** - 60 s window; the ESP reboots if it locks up.
-- **Status LED** - solid when a zone is running, fast blink when Wi-Fi is down,
-  medium blink when MQTT is down, slow heartbeat when healthy.
+## Behaviour
+
+| | Condition to allow the pump |
+|---|---|
+| **Night** (22:00–04:59) | `level > waterLevelThreshold` (5 cm) |
+| **Day** (05:00–21:59) | `level > criticalWaterLevel` (32 cm) **or** rising ≥ 1.0 cm/min |
+| **Always required** | MQTT has not published `no` to the safety topic |
+| **Refractory** | 5 min lockout after each window — bypassed when critical |
+| **Window** | 5 min max, closes early once drained (min 30 s) |
+
+Two failure directions are deliberate: an unknown clock falls back to **night**
+rules so a network outage cannot disarm flood protection, and a critical level
+**bypasses** the refractory so a real flood is not locked out half the time.
+
+## Status LED
+
+One LED, counted blink codes — N pulses, then a long dark gap.
+
+| LED | Meaning |
+|---|---|
+| Solid on | Pump allowed right now |
+| 1 blip | All good, idle |
+| 2 blips | No WiFi |
+| 3 blips | WiFi up, no MQTT broker |
+| 4 blips | Connected, clock not NTP-synced |
+| 5 blips | MQTT reported unsafe to operate |
+| 6 blips | Sender table malformed — pump forced allow |
+| Dark | Firmware not running |
 
 ## Hardware
 
-1. **ESP8266** - NodeMCU 1.0 or a bare ESP-12F.
-2. **3-channel relay module** wired to:
+Seeed XIAO ESP32-C3, a resistive level sender (240 Ω empty → 33 Ω full, the
+standard automotive range), and a relay module on its own supply.
 
-   | Zone | Sketch macro | Pin | GPIO |
-   |------|--------------|-----|------|
-   | 0    | `RELAY0_PIN` | D1  | 5    |
-   | 1    | `RELAY1_PIN` | D2  | 4    |
-   | 2    | `RELAY2_PIN` | D5  | 14   |
+```
+SUPPLY --[ R_TOP ]--+-- node --[10k]--+-- D1 (ADC)
+                    |                 |
+                [ sender ]         [100nF]
+                    |                 |
+                   GND               GND
+```
 
-   The sketch drives the relays **active HIGH** (`digitalWrite(pin, HIGH)` opens
-   a valve). If your relay board is active LOW, invert the writes in
-   `mqttCallback()` and `enforceAutoOff()`.
+| XIAO pin | Function |
+|---|---|
+| D1 | Divider node, via 10k series + 100nF to GND |
+| D10 | Relay inhibit/allow, **10k pull-up to 3V3** |
+| D5 | Status LED anode → 220 Ω → GND |
 
-3. **An MQTT broker** - e.g. the Mosquitto add-on on Home Assistant.
-4. **An OpenWeatherMap API key** - only needed for the rain check.
+Non-negotiable details:
 
-## Firmware setup
+- **ADC1 only.** D0/D1/D2 work; D3 is ADC2 and returns garbage while WiFi runs.
+- **BAT54 Schottky from D1 to 3V3.** An open sender pulls the node to the full
+  supply; the 10k plus the clamp keeps that off the GPIO.
+- **10k pull-up on D10.** `INHIBIT_ACTIVE_LEVEL` is HIGH, so a floating-low pin
+  at boot means *pump allowed* — the wrong failure direction. Internal pull-ups
+  are inactive during reset.
+- **5V pin or USB, never both.** That pin is USB VBUS.
 
-Credentials are kept out of git in `src/config.h`:
+## Build
+
+Arduino IDE, board **XIAO_ESP32C3**, **USB CDC On Boot: Enabled** (otherwise
+`Serial` goes to the GPIO20/21 UART and the monitor stays empty), Flash Mode
+DIO. Libraries: `PubSubClient`, `ezTime`.
 
 ```sh
-cp src/config.example.h src/config.h
-$EDITOR src/config.h
+cp config.example.h config.h   # then fill in your credentials
 ```
 
-Fill in your Wi-Fi SSID/password, the broker address, and the MQTT username and
-password. `src/config.h` is in `.gitignore`.
+`config.h` is git-ignored and must never be committed.
 
-### Building
+## Calibration
 
-**PlatformIO** - `pio run -t upload` from the repo root.
+Level is looked up by **sender resistance**, not ADC counts, so the table
+survives a change of supply voltage, top resistor, or chip.
 
-**Arduino IDE** - the IDE requires the sketch folder and the `.ino` to share a
-name, so copy the two files into a folder called `irrigator/`:
+1. Measure `SUPPLY_MV` and `R_TOP_OHM` with a meter — on the supply you will
+   actually run on. USB VBUS and an external brick do not read the same.
+2. Set `CALIBRATION_VERBOSE 1` and log resistance against known water heights.
+3. Replace `senderTable[]`. It must be strictly ascending in resistance and
+   descending in level; `validateSenderTable()` checks this at boot and fails
+   the pump to *allowed* if it does not hold.
 
-```sh
-mkdir -p ~/Arduino/irrigator
-cp src/irrigator.ino src/config.h ~/Arduino/irrigator/
-```
+The sender is not linear — roughly 3.5 Ω/cm through the main body but ~12 Ω/cm
+below 7 cm. Keep the dense rows at the bottom; that is where the decisions are.
 
-Then select board *NodeMCU 1.0 (ESP-12E Module)* and upload. Requires the
-`PubSubClient` library.
+## MQTT
 
-### Putting a bare ESP-12F into flash mode
+| Topic | Direction | Payload |
+|---|---|---|
+| `pool/sumppump/safe` | in | `no` inhibits the pump; anything else allows it |
+| `pool/sumppump/status` | out, retained | `allow` / `inhibit` |
+| `pool/sumppump/level` | out | level in cm |
+| `pool/sumppump/alert` | out | sensor faults, ineffective pump, expired safety hold |
+| `pool/sumppump/log` | out | boot and 5-minute heartbeat diagnostics |
 
-A NodeMCU-style board with onboard USB handles this automatically - just hit
-upload. A bare module wired to a USB-serial adapter does not:
+A `no` on the safety topic expires after 30 minutes without a broker update and
+fails **open**. A latch that can never be cleared is a flood waiting to happen.
 
-1. Wire adapter TX -> ESP RXD0, RX -> TXD0, GND -> GND, 3.3 V -> VCC.
-   **The ESP-12F is 3.3 V only - 5 V will destroy it.** CH_PD/EN must be pulled high.
-2. Pull **GPIO0 to GND** (jumper, or hold the Flash/Boot button).
-3. While GPIO0 is held low, briefly pulse **RST** to GND and release.
-4. Keep GPIO0 grounded for the whole upload.
-5. When the upload finishes, release GPIO0 and tap RST again to boot normally.
+## Resilience
 
-## Broker configuration
+- Task watchdog on the loop task, 60 s.
+- Connectivity watchdog: reboot after 15 min offline, since the task WDT cannot
+  catch a wedged network stack — `loop()` keeps running and feeding it. Defers
+  while a flush is in progress.
+- Reset reason reported at boot and in heartbeats. Watch for `BROWNOUT`: a pump
+  motor starting sags a shared supply and otherwise looks like a random reboot.
 
-The firmware authenticates, so the broker needs a matching login. For the Home
-Assistant Mosquitto add-on, under *Settings > Add-ons > Mosquitto broker >
-Configuration*:
+## License
 
-```yaml
-logins:
-  - username: irrigator
-    password: <a long random password>
-```
-
-Use the same values in `src/config.h`.
-
-> If the firmware connects **without** credentials, the broker log fills with
-> `received null username or password for unpwd check` followed by
-> `Client ESP8266Client-irrigator disconnected, not authorised`, and the zones
-> never respond. That log line is the fastest way to diagnose it.
-
-## Home Assistant integration
-
-Merge [`homeassistant/configuration.yaml`](homeassistant/configuration.yaml)
-into your own config. It provides:
-
-- three MQTT switches, `switch.irrigation_zone_0` / `_1` / `_2`
-- `input_select.irrigation_zone` - the single control surface
-- `sensor.rain_probability` - a template sensor built from the OpenWeatherMap
-  daily forecast
-- the exclusivity automation and the watering schedule
-
-Add the OpenWeatherMap integration through the UI *before* reloading, so the API
-key stays out of your config file.
-
-For the dashboard card, see
-[`homeassistant/lovelace-irrigation.yaml`](homeassistant/lovelace-irrigation.yaml).
-
-### How control flows
-
-```
-dashboard / schedule --> input_select.irrigation_zone
-                              |
-                              v
-                "Irrigation select exclusive"
-                              |
-                closes all 3, opens the chosen one
-                              |
-                              v
-                   switch.irrigation_zone_N
-                              |
-                       MQTT command_topic
-                              v
-                            ESP8266
-```
-
-Because everything routes through the selector, the dashboard always shows which
-zone is actually running.
-
-### Schedule
-
-| Zone | Name          | Days          | Window        |
-|------|---------------|---------------|---------------|
-| 1    | House front   | Tue, Thu, Sat | 02:11 - 02:48 |
-| 0    | Car side      | Tue, Sat      | 02:48 - 03:35 |
-| 2    | Street corner | Tue, Sat      | 03:35 - 05:20 |
-
-Each step hands over to the next. A zone only *starts* if rain probability is
-under 50%; the handover and the final 05:20 all-off run unconditionally, so a
-skipped condition can never leave a valve open. The 05:20 step also issues a
-direct `switch.turn_off` on all three zones as a fail-safe, independent of the
-selector.
-
-Rename the zones by editing the `options:` list of `input_select.irrigation_zone`
-and the matching `value_template` strings in the exclusivity automation.
-
-### Why OpenWeatherMap and not Met.no
-
-`sensor.rain_probability` is derived from `weather.openweathermap` because
-**Met.no does not expose `precipitation_probability`** - its forecasts only carry
-`precipitation` in mm. If you point the template sensor at a Met.no entity it
-will silently return 0 and you will water through every storm.
-
-## Known gaps
-
-- **No state feedback.** The firmware subscribes to `irrigation/controlN` but
-  never publishes to `irrigation/statusN`, so Home Assistant shows commanded
-  state, not confirmed state. Publishing a retained message on each relay change
-  would close this loop.
-- **No soil moisture input** - watering is purely time and forecast driven.
-- **`retain: true`** on the command topics means the ESP replays the last command
-  on reconnect. Convenient, but a stale retained `on` will reopen a valve at boot.
-
-## Future plans
-
-- **Plant Mood Detection(TM)**: photograph the ferns, run them through a neural
-  net, trigger emergency sprinkling if they give you the stink eye.
-- **Quantum Soil Moisture Sensor**: the soil is both wet and dry until observed.
-  More research needed.
-- **Interplanetary Irrigation**: red-dust-resistant nozzles and dust-storm mode
-  for the Mars colony. Earth mode still works.
-- **Astrological Alignment**: Mercury in retrograde? Best hold off. Full moon in
-  Leo? Water twice.
-- **Plant-GPT**: "Hey Basil, you look thirsty. Drizzle or deluge?" Basil: "Yes."
+See [LICENSE](LICENSE).
