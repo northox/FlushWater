@@ -1,10 +1,14 @@
 # Local credentials - never commit
+src/config.h
 config.h
 secrets.yaml
 
-# Arduino / PlatformIO build output
-build/
+# PlatformIO
 .pio/
+.pio.nosync
+
+# Arduino build output
+build/
 *.bin
 *.elf
 *.hex

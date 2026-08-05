@@ -1,0 +1,114 @@
+# -----------------------------------------------------------------------------
+#  FlushWaterNG — Home Assistant MQTT entities
+#
+#  Add to configuration.yaml, or include it. Restart HA afterwards.
+#  The broker must have a matching login (see src/config.example.h).
+# -----------------------------------------------------------------------------
+
+mqtt:
+  sensor:
+    # Water level in cm. Published on change (>= 2 cm) or every 20 min.
+    - name: "Sump Water Level"
+      unique_id: flushwater_level
+      state_topic: "pool/sumppump/level"
+      unit_of_measurement: "cm"
+      device_class: distance
+      state_class: measurement
+      icon: mdi:waves-arrow-up
+
+    # Faults: sensor out of range, pump ineffective, safety hold expired.
+    - name: "Sump Last Alert"
+      unique_id: flushwater_alert
+      state_topic: "pool/sumppump/alert"
+      icon: mdi:alert-circle
+      value_template: "{{ value[:255] }}"
+
+    # Boot line and 5-minute heartbeat: reset reason, IP, RSSI, heap, uptime.
+    # Watch for reset=BROWNOUT — the pump motor sagging a shared supply.
+    - name: "Sump Diagnostics"
+      unique_id: flushwater_log
+      state_topic: "pool/sumppump/log"
+      entity_category: diagnostic
+      icon: mdi:file-document-outline
+      value_template: "{{ value[:255] }}"
+
+  binary_sensor:
+    # Retained, so this resolves correctly after an HA or broker restart.
+    - name: "Sump Pump Allowed"
+      unique_id: flushwater_allowed
+      state_topic: "pool/sumppump/status"
+      payload_on: "allow"
+      payload_off: "inhibit"
+      device_class: running
+      icon: mdi:water-pump
+
+  switch:
+    # Turning this ON publishes "no", which inhibits the pump.
+    #
+    # IMPORTANT: the controller expires this hold after 30 minutes without a
+    # further message and fails OPEN. That is deliberate — a latch that can
+    # never be cleared is a flood waiting to happen. If you want the hold to
+    # persist, re-publish it (see the automation below).
+    - name: "Sump Safety Hold"
+      unique_id: flushwater_safety_hold
+      command_topic: "pool/sumppump/safe"
+      payload_on: "no"
+      payload_off: "yes"
+      state_topic: "pool/sumppump/safe"
+      state_on: "no"
+      state_off: "yes"
+      optimistic: false
+      qos: 1
+      retain: false
+      icon: mdi:hand-back-right
+
+# -----------------------------------------------------------------------------
+#  Automations — put these in automations.yaml
+# -----------------------------------------------------------------------------
+#
+# - alias: "Sump - refresh safety hold"
+#   description: >
+#     The controller drops a safety hold after 30 min with no broker update.
+#     Re-publish every 10 min so a deliberate hold survives, while an HA
+#     outage still lets the controller fail open and protect the basement.
+#   trigger:
+#     - platform: time_pattern
+#       minutes: "/10"
+#   condition:
+#     - condition: state
+#       entity_id: switch.sump_safety_hold
+#       state: "on"
+#   action:
+#     - service: mqtt.publish
+#       data:
+#         topic: "pool/sumppump/safe"
+#         payload: "no"
+#         qos: 1
+#
+# - alias: "Sump - notify on alert"
+#   trigger:
+#     - platform: state
+#       entity_id: sensor.sump_last_alert
+#   condition:
+#     - condition: template
+#       value_template: "{{ trigger.to_state.state not in ['unknown','unavailable',''] }}"
+#   action:
+#     - service: notify.persistent_notification
+#       data:
+#         title: "Sump pump alert"
+#         message: "{{ trigger.to_state.state }}"
+#
+# - alias: "Sump - notify if controller goes silent"
+#   description: >
+#     Heartbeat is every 5 min. No diagnostics for 20 min means the controller
+#     is down, wedged, or rebooting — and nothing is watching the water.
+#   trigger:
+#     - platform: state
+#       entity_id: sensor.sump_diagnostics
+#       to: ~
+#       for: "00:20:00"
+#   action:
+#     - service: notify.persistent_notification
+#       data:
+#         title: "Sump controller silent"
+#         message: "No heartbeat for 20 minutes. Check the controller."

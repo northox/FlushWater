@@ -67,15 +67,21 @@ Non-negotiable details:
 
 ## Build
 
-Arduino IDE, board **XIAO_ESP32C3**, **USB CDC On Boot: Enabled** (otherwise
-`Serial` goes to the GPIO20/21 UART and the monitor stays empty), Flash Mode
-DIO. Libraries: `PubSubClient`, `ezTime`.
+PlatformIO:
 
 ```sh
-cp config.example.h config.h   # then fill in your credentials
+cp src/config.example.h src/config.h   # then fill in your credentials
+pio run -t upload
+pio device monitor
 ```
 
-`config.h` is git-ignored and must never be committed.
+`src/config.h` is git-ignored and must never be committed.
+
+Arduino IDE also works — copy `src/main.cpp` to `FlushWaterNG.ino` alongside
+`config.h`, select board **XIAO_ESP32C3** and set **USB CDC On Boot: Enabled**.
+Without that setting `Serial` is routed to the GPIO20/21 UART, which is not
+wired to the USB-C connector, and the monitor stays silent. The source carries
+explicit forward declarations, so it compiles as either `.ino` or `.cpp`.
 
 ## Calibration
 
@@ -104,6 +110,36 @@ below 7 cm. Keep the dense rows at the bottom; that is where the decisions are.
 
 A `no` on the safety topic expires after 30 minutes without a broker update and
 fails **open**. A latch that can never be cleared is a flood waiting to happen.
+
+## Home Assistant
+
+Copy the entities from [`configuration.yaml`](configuration.yaml) into your HA
+config and restart. The broker needs a matching login — see
+[`src/config.example.h`](src/config.example.h).
+
+You get:
+
+| Entity | What it is |
+|---|---|
+| `sensor.sump_water_level` | Level in cm, graphable |
+| `binary_sensor.sump_pump_allowed` | Whether the pump may run right now |
+| `switch.sump_safety_hold` | Turn on to inhibit the pump |
+| `sensor.sump_last_alert` | Sensor faults, ineffective pump, expired hold |
+| `sensor.sump_diagnostics` | Boot line and 5-minute heartbeat |
+
+[`lovelace-flushwater.yaml`](lovelace-flushwater.yaml) has a dashboard card with
+the level history and pump state overlaid.
+
+**The safety hold is deliberately not sticky.** Turning the switch on publishes
+`no`, but the controller drops that hold after 30 minutes without a further
+message. If you want a hold to persist, re-publish it on a timer — there is a
+commented automation in `configuration.yaml` that does exactly that every 10
+minutes. That way a deliberate hold survives, while an HA outage still lets the
+controller fail open and protect the basement.
+
+Worth adding: an alert if `sensor.sump_diagnostics` goes stale for 20 minutes.
+The heartbeat is every 5, so silence means the controller is down or wedged and
+nothing is watching the water. Also commented in `configuration.yaml`.
 
 ## Resilience
 

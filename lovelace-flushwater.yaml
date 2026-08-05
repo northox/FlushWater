@@ -1,0 +1,38 @@
+# FlushWaterNG — Lovelace dashboard card
+# Settings > Dashboards > (your dashboard) > Raw configuration editor
+
+type: vertical-stack
+cards:
+  - type: entities
+    title: Sump Pump
+    entities:
+      - entity: sensor.sump_water_level
+        name: Water level
+      - entity: binary_sensor.sump_pump_allowed
+        name: Pump
+      - type: divider
+      - entity: switch.sump_safety_hold
+        name: Safety hold (expires after 30 min)
+      - type: divider
+      - entity: sensor.sump_last_alert
+        name: Last alert
+      - entity: sensor.sump_diagnostics
+        name: Diagnostics
+
+  - type: history-graph
+    title: Water level
+    hours_to_show: 48
+    entities:
+      - entity: sensor.sump_water_level
+      - entity: binary_sensor.sump_pump_allowed
+
+  - type: conditional
+    conditions:
+      - entity: binary_sensor.sump_pump_allowed
+        state: "on"
+    card:
+      type: markdown
+      content: >
+        ### Pump running
+        Level is {{ states('sensor.sump_water_level') }} cm.
+        The window closes on drain or after 5 minutes, whichever is first.
