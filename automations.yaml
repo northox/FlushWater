@@ -1,0 +1,92 @@
+# -----------------------------------------------------------------------------
+#  FlushWaterNG — Home Assistant automations
+#
+#  In configuration.yaml:   automation: !include automations.yaml
+#  (or paste these into your existing automations.yaml)
+# -----------------------------------------------------------------------------
+
+# --- Makes the safety hold persist -------------------------------------------
+#
+# The controller drops a safety hold after 30 minutes with no broker update and
+# fails OPEN. That is deliberate: a latch nothing can clear is a flood waiting
+# to happen. This automation re-publishes the hold every 10 minutes so a hold
+# you set on purpose survives indefinitely, while an HA or broker outage still
+# lets the controller fall back to protecting the basement.
+#
+# 10 min against a 30 min expiry means two consecutive misses are tolerated
+# before the hold lapses. Do not widen that gap much: at 25 min a single missed
+# run releases the pump.
+- alias: "Sump - keep safety hold alive"
+  id: flushwater_hold_keepalive
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/10"
+    # Re-assert immediately when you flip the switch, rather than waiting for
+    # the next tick.
+    - platform: state
+      entity_id: switch.sump_safety_hold
+      to: "on"
+  condition:
+    - condition: state
+      entity_id: switch.sump_safety_hold
+      state: "on"
+  action:
+    - service: mqtt.publish
+      data:
+        topic: "pool/sumppump/safe"
+        payload: "no"
+        qos: 1
+
+# --- Release the hold cleanly ------------------------------------------------
+- alias: "Sump - release safety hold"
+  id: flushwater_hold_release
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: switch.sump_safety_hold
+      to: "off"
+  action:
+    - service: mqtt.publish
+      data:
+        topic: "pool/sumppump/safe"
+        payload: "yes"
+        qos: 1
+
+# --- Surface controller alerts ------------------------------------------------
+- alias: "Sump - notify on alert"
+  id: flushwater_alert
+  mode: queued
+  trigger:
+    - platform: state
+      entity_id: sensor.sump_last_alert
+  condition:
+    - condition: template
+      value_template: >
+        {{ trigger.to_state.state not in ['unknown', 'unavailable', ''] }}
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Sump pump alert"
+        message: "{{ trigger.to_state.state }}"
+
+# --- Catch a dead controller --------------------------------------------------
+#
+# Heartbeat is every 5 minutes. Twenty minutes of silence means the controller
+# is down, wedged or rebooting — and nothing is watching the water. The
+# firmware's own connectivity watchdog reboots after 15 min offline, so if you
+# see this, that recovery did not work either.
+- alias: "Sump - notify if controller goes silent"
+  id: flushwater_silent
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.sump_diagnostics
+      for: "00:20:00"
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Sump controller silent"
+        message: >
+          No heartbeat for 20 minutes. The controller is not reporting and the
+          pump is running unsupervised on its own float switch.

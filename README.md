@@ -130,16 +130,27 @@ You get:
 [`lovelace-flushwater.yaml`](lovelace-flushwater.yaml) has a dashboard card with
 the level history and pump state overlaid.
 
-**The safety hold is deliberately not sticky.** Turning the switch on publishes
-`no`, but the controller drops that hold after 30 minutes without a further
-message. If you want a hold to persist, re-publish it on a timer — there is a
-commented automation in `configuration.yaml` that does exactly that every 10
-minutes. That way a deliberate hold survives, while an HA outage still lets the
-controller fail open and protect the basement.
+Add the automations too:
 
-Worth adding: an alert if `sensor.sump_diagnostics` goes stale for 20 minutes.
-The heartbeat is every 5, so silence means the controller is down or wedged and
-nothing is watching the water. Also commented in `configuration.yaml`.
+```yaml
+automation: !include automations.yaml
+```
+
+**How the persistent hold works.** Turning the switch on publishes `no`, but the
+controller drops that hold after 30 minutes without a further message — a latch
+nothing can clear is a flood waiting to happen. So HA re-publishes it every 10
+minutes, and a hold you set on purpose lasts indefinitely.
+
+The two halves matter together: as long as HA is alive the hold sticks, and if
+HA or the broker dies the hold lapses within 30 minutes and the controller goes
+back to protecting the basement on its own. The 10-minute interval tolerates two
+consecutive missed runs. Don't widen it much — at 25 minutes a single missed run
+releases the pump.
+
+`automations.yaml` also notifies on any controller alert, and warns if
+`sensor.sump_diagnostics` goes quiet for 20 minutes. The heartbeat is every 5,
+so silence means the controller is down and the pump is running unsupervised on
+its own float switch.
 
 ## Resilience
 

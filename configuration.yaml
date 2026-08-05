@@ -45,10 +45,10 @@ mqtt:
   switch:
     # Turning this ON publishes "no", which inhibits the pump.
     #
-    # IMPORTANT: the controller expires this hold after 30 minutes without a
-    # further message and fails OPEN. That is deliberate — a latch that can
-    # never be cleared is a flood waiting to happen. If you want the hold to
-    # persist, re-publish it (see the automation below).
+    # The controller expires this hold after 30 minutes without a further
+    # message and fails OPEN — a latch nothing can clear is a flood waiting to
+    # happen. The "keep safety hold alive" automation in automations.yaml
+    # re-publishes every 10 min so a deliberate hold persists anyway.
     - name: "Sump Safety Hold"
       unique_id: flushwater_safety_hold
       command_topic: "pool/sumppump/safe"
@@ -63,52 +63,9 @@ mqtt:
       icon: mdi:hand-back-right
 
 # -----------------------------------------------------------------------------
-#  Automations — put these in automations.yaml
+#  Automations live in automations.yaml. Include them with:
+#
+#      automation: !include automations.yaml
+#
+#  The "keep safety hold alive" automation there is what makes a hold stick.
 # -----------------------------------------------------------------------------
-#
-# - alias: "Sump - refresh safety hold"
-#   description: >
-#     The controller drops a safety hold after 30 min with no broker update.
-#     Re-publish every 10 min so a deliberate hold survives, while an HA
-#     outage still lets the controller fail open and protect the basement.
-#   trigger:
-#     - platform: time_pattern
-#       minutes: "/10"
-#   condition:
-#     - condition: state
-#       entity_id: switch.sump_safety_hold
-#       state: "on"
-#   action:
-#     - service: mqtt.publish
-#       data:
-#         topic: "pool/sumppump/safe"
-#         payload: "no"
-#         qos: 1
-#
-# - alias: "Sump - notify on alert"
-#   trigger:
-#     - platform: state
-#       entity_id: sensor.sump_last_alert
-#   condition:
-#     - condition: template
-#       value_template: "{{ trigger.to_state.state not in ['unknown','unavailable',''] }}"
-#   action:
-#     - service: notify.persistent_notification
-#       data:
-#         title: "Sump pump alert"
-#         message: "{{ trigger.to_state.state }}"
-#
-# - alias: "Sump - notify if controller goes silent"
-#   description: >
-#     Heartbeat is every 5 min. No diagnostics for 20 min means the controller
-#     is down, wedged, or rebooting — and nothing is watching the water.
-#   trigger:
-#     - platform: state
-#       entity_id: sensor.sump_diagnostics
-#       to: ~
-#       for: "00:20:00"
-#   action:
-#     - service: notify.persistent_notification
-#       data:
-#         title: "Sump controller silent"
-#         message: "No heartbeat for 20 minutes. Check the controller."
