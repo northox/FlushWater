@@ -37,8 +37,6 @@
 #include <esp_task_wdt.h>
 #include <esp_system.h>
 
-// Wi-Fi + MQTT credentials live in config.h, which is git-ignored.
-// Copy config.example.h to config.h and fill in your own values.
 #include "config.h"
 
 // ------------------------------------------------- pins (XIAO ESP32C3) ----
@@ -55,15 +53,10 @@
 #define PUMP_RELAY_PIN  D10   // GPIO10, no alternate function — cleanest output
 #define STATUS_LED_PIN  D5    // GPIO7. THE status LED. Anode -> 220R -> D5.
 
-// The XIAO ESP32C3 has NO user-controllable onboard LED — the only LED on the
-// board is the battery charge indicator, hard-wired to VCC_3V3. LED_BUILTIN is
-// not defined for this variant, so the status LED must be external.
-
 #define INHIBIT_ACTIVE_LEVEL HIGH   // set to LOW if your relay logic is inverted
 #define SLEEP        10000
 #define MORNING      5
 #define NIGHT        22
-#define ROD_LENGTH   42             // informational; level now comes from ohms
 #define MAX_BACKOFF  40000UL
 
 // ------------------------------------------------------------- config ----
@@ -74,6 +67,11 @@ const int   mqttPort     = MQTT_PORT;
 const char* mqttUser     = MQTT_USER;
 const char* mqttPassword = MQTT_PASSWORD;
 const char* ntpServer    = NTP_SERVER;
+
+// Retained. "online" while we are connected, "offline" published by the broker
+// itself via the Last Will if we stop answering. Home Assistant hangs its
+// availability off this, so a dead controller shows as unavailable there.
+#define AVAILABILITY_TOPIC "pool/sumppump/availability"
 
 const int waterLevelThreshold = 5;    // night eligibility
 const int criticalWaterLevel  = 32;   // day threshold
@@ -88,6 +86,14 @@ const unsigned long EFFECTIVENESS_GRACE_MS = 120000UL;  // must be < pumpOperati
 const unsigned long LEVEL_PUB_PERIOD_MS    = 1200000UL;
 const int           LEVEL_PUB_DELTA_CM     = 2;
 const unsigned long RISE_WINDOW_SEC        = 300;
+
+// Shortest sample span riseCmPerMin() will compute a rate from. Below this the
+// figure is dominated by sensor jitter rather than by water moving.
+const unsigned long MIN_RISE_SPAN_SEC      = 120;
+
+// Nothing flushes on a non-critical level until the clock is real and the
+// level buffer has some history behind it. See decideFlush().
+const unsigned long STARTUP_GRACE_MS       = 90000UL;
 
 /* Resilience timers.
  *   SAFE_FLAG_TTL_MS  an MQTT "no" latches pumpOperationSafe false. If the
@@ -368,7 +374,14 @@ void ensureMQTT() {
     // is the closest equivalent and is unique per device.
     String cid = String("ESP32C3-") +
                  String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFUL), HEX);
-    mqttClient.connect(cid.c_str(), mqttUser, mqttPassword);
+
+    /* Last Will and Testament. The broker publishes "offline" on this topic
+     * by itself if we stop answering keepalives, which is the only way Home
+     * Assistant can tell a dead controller from a quiet one. Retained, so the
+     * state survives an HA restart. This is what replaces the heartbeat blink
+     * we removed from the LED. */
+    mqttClient.connect(cid.c_str(), mqttUser, mqttPassword,
+                       AVAILABILITY_TOPIC, 1, true, "offline");
     for (int k = 0; k < 10; k++) { mqttClient.loop(); delay(50); }
     wdtFeed();
   }
@@ -376,6 +389,7 @@ void ensureMQTT() {
     Serial.println("attempt failed.");
   } else {
     Serial.println("connected.");
+    mqttClient.publish(AVAILABILITY_TOPIC, "online", true);   // clears the will
     mqttClient.subscribe("pool/sumppump/safe");
     // Retained, so Home Assistant resolves our state after a broker or
     // controller restart instead of sitting at "unknown".
@@ -571,6 +585,17 @@ float riseCmPerMin(unsigned long windowSec) {
   if (!findReadingOlderThan(windowSec, oldLvl, oldTs)) return 0.0f;
   time_t nowSec = time(nullptr);
   if (nowSec <= oldTs) return 0.0f;
+
+  /* findReadingOlderThan() falls back to the OLDEST sample when nothing spans
+   * the requested window. Right after boot that is a reading from one second
+   * ago, and 1 cm of sensor jitter across 1 s computes as 60 cm/min — which
+   * sails past FAST_RISE_CMPM, is treated as critical, and therefore also
+   * bypasses the refractory. That is the spurious flush on startup.
+   *
+   * Refuse to report a rate at all until the samples actually span a useful
+   * interval. A rate measured over two minutes is meaningful; one measured
+   * over two seconds is noise with a large number attached. */
+  if ((unsigned long)(nowSec - oldTs) < MIN_RISE_SPAN_SEC) return 0.0f;
   float delta   = (float)level - (float)oldLvl;
   float minutes = (nowSec - oldTs) / 60.0f;
   if (minutes <= 0.0f) return 0.0f;      // guard against divide-by-zero
@@ -582,7 +607,7 @@ float riseCmPerMin(unsigned long windowSec) {
  * Counting pulses is far easier than judging blink rates by eye.
  *
  *   SOLID ON   pump ALLOWED right now (allow window open)
- *   1 blip     all good, idle — normal heartbeat
+ *   DARK       all good, idle — nothing needs your attention
  *   2 blips    no WiFi
  *   3 blips    WiFi up, but no MQTT broker
  *   4 blips    connected, but clock not synced to NTP
@@ -591,8 +616,8 @@ float riseCmPerMin(unsigned long windowSec) {
  *   DARK       firmware not running (crashed, or held in reset)
  *
  * Only the highest-priority active condition is shown, and codes ascend with
- * severity — more blinking is worse.                                        */
-#define LED_CODE_OK       1
+ * severity — more blinking is worse.                        */
+#define LED_CODE_OK       0    // dark — see note above
 #define LED_CODE_NO_WIFI  2
 #define LED_CODE_NO_MQTT  3
 #define LED_CODE_NO_TIME  4
@@ -629,6 +654,13 @@ void driveLedNonBlocking() {
     digitalWrite(STATUS_LED_PIN, HIGH);
     ledPatternStart = nowMs;
     lastCode = -1;              // force a clean restart when solid ends
+    return;
+  }
+
+  if (code == LED_CODE_OK) {    // healthy and idle: stay dark
+    digitalWrite(STATUS_LED_PIN, LOW);
+    ledPatternStart = nowMs;
+    lastCode = code;
     return;
   }
 
@@ -749,6 +781,28 @@ void decideFlush() {
   bool critical     = (level > criticalWaterLevel) || (rise >= FAST_RISE_CMPM);
   bool blocked      = inRefractory && !critical;
   bool eligible     = isNight ? (level > waterLevelThreshold) : critical;
+
+  /* Startup grace. Before NTP lands, timeOK is false and isNight therefore
+   * defaults to true — which is right for flood safety but means the
+   * permissive night threshold applies. Boot in daylight with a normal 6 cm
+   * in the sump and it flushes immediately for no reason.
+   *
+   * So hold off on ordinary decisions until the clock is real and we have
+   * been up long enough for the level history to mean something. A genuinely
+   * high LEVEL still gets through: if the sump is actually full at boot we
+   * pump, clock or no clock. Only the rise-rate path is suppressed, because
+   * that is the one that cannot be trusted yet. */
+  bool warmedUp = timeOK && (millis() >= STARTUP_GRACE_MS);
+  if (!warmedUp && !(level > criticalWaterLevel)) {
+    static bool graceLogged = false;
+    if (!graceLogged) {
+      graceLogged = true;
+      Serial.printf("Startup grace: holding off until clock+history settle "
+                    "(level %d cm, clock %s)\n", level, timeOK ? "ok" : "not set");
+    }
+    if (!isInhibited()) endAllowWindow();
+    return;
+  }
 
   if (pumpOperationSafe && eligible && !blocked) {
     allowPumpFor(pumpOperationTimeout);

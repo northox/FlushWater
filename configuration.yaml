@@ -5,12 +5,30 @@
 #  The broker must have a matching login (see src/config.example.h).
 # -----------------------------------------------------------------------------
 
+# Every entity below hangs off pool/sumppump/availability. The controller
+# publishes "online" retained on connect; the broker publishes "offline" by
+# itself via the Last Will if the controller stops answering keepalives. So a
+# dead ESP shows as unavailable in HA rather than silently holding its last
+# value — which, for a level reading, would look exactly like a calm sump.
+#
+# Expect roughly 45 s of lag: the will fires after 1.5x the 30 s keepalive.
+
 mqtt:
+  binary_sensor:
+    - name: "Sump Controller"
+      unique_id: flushwater_online
+      state_topic: "pool/sumppump/availability"
+      payload_on: "online"
+      payload_off: "offline"
+      device_class: connectivity
+      entity_category: diagnostic
+
   sensor:
     # Water level in cm. Published on change (>= 2 cm) or every 20 min.
     - name: "Sump Water Level"
       unique_id: flushwater_level
       state_topic: "pool/sumppump/level"
+      availability_topic: "pool/sumppump/availability"
       unit_of_measurement: "cm"
       device_class: distance
       state_class: measurement
@@ -20,6 +38,7 @@ mqtt:
     - name: "Sump Last Alert"
       unique_id: flushwater_alert
       state_topic: "pool/sumppump/alert"
+      availability_topic: "pool/sumppump/availability"
       icon: mdi:alert-circle
       value_template: "{{ value[:255] }}"
 
@@ -28,6 +47,7 @@ mqtt:
     - name: "Sump Diagnostics"
       unique_id: flushwater_log
       state_topic: "pool/sumppump/log"
+      availability_topic: "pool/sumppump/availability"
       entity_category: diagnostic
       icon: mdi:file-document-outline
       value_template: "{{ value[:255] }}"
@@ -37,6 +57,7 @@ mqtt:
     - name: "Sump Pump Allowed"
       unique_id: flushwater_allowed
       state_topic: "pool/sumppump/status"
+      availability_topic: "pool/sumppump/availability"
       payload_on: "allow"
       payload_off: "inhibit"
       device_class: running
@@ -55,6 +76,7 @@ mqtt:
       payload_on: "no"
       payload_off: "yes"
       state_topic: "pool/sumppump/safe"
+      availability_topic: "pool/sumppump/availability"
       state_on: "no"
       state_off: "yes"
       optimistic: false

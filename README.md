@@ -27,14 +27,13 @@ One LED, counted blink codes — N pulses, then a long dark gap.
 
 | LED | Meaning |
 |---|---|
+| **Dark** | **All good — nothing needs your attention** |
 | Solid on | Pump allowed right now |
-| 1 blip | All good, idle |
 | 2 blips | No WiFi |
 | 3 blips | WiFi up, no MQTT broker |
 | 4 blips | Connected, clock not NTP-synced |
 | 5 blips | MQTT reported unsafe to operate |
 | 6 blips | Sender table malformed — pump forced allow |
-| Dark | Firmware not running |
 
 ## Hardware
 
@@ -126,6 +125,15 @@ You get:
 | `switch.sump_safety_hold` | Turn on to inhibit the pump |
 | `sensor.sump_last_alert` | Sensor faults, ineffective pump, expired hold |
 | `sensor.sump_diagnostics` | Boot line and 5-minute heartbeat |
+| `binary_sensor.sump_controller` | Whether the controller is alive at all |
+
+**Availability.** The controller publishes `online` retained to
+`pool/sumppump/availability`, and registers an MQTT Last Will so the *broker*
+publishes `offline` by itself if the controller stops answering keepalives.
+Every entity hangs off that topic, so a dead ESP shows as unavailable rather
+than silently holding its last reading — which, for a water level, would look
+exactly like a calm sump. Expect ~45 s of lag; the will fires after 1.5× the
+30 s keepalive.
 
 [`lovelace-flushwater.yaml`](lovelace-flushwater.yaml) has a dashboard card with
 the level history and pump state overlaid.
