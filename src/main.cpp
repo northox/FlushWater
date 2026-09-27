@@ -747,12 +747,13 @@ void effectivenessCheckAlert() {
 /* THE RULES, in one place:
  *
  *   NIGHT (22:00-04:59)  flush when level > waterLevelThreshold (5 cm)
- *   DAY   (05:00-21:59)  flush only when CRITICAL:
- *                          level > criticalWaterLevel (32 cm)
- *                          OR rising >= FAST_RISE_CMPM (1.0 cm/min)
+ *   DAY   (05:00-21:59)  flush only when EMERGENCY or RAINING:
+ *                          EMERGENCY = level > criticalWaterLevel (32 cm)
+ *                          RAINING   = rising >= FAST_RISE_CMPM (1.0 cm/min)
+ *                                      AND level > waterLevelThreshold
  *   ALWAYS REQUIRED      pumpOperationSafe (MQTT has not said "no")
  *   REFRACTORY           5 min lockout after a window closes,
- *                        BYPASSED when critical
+ *                        BYPASSED only by EMERGENCY, never by RAINING
  *   WINDOW               5 min max, closes early once level <= 0 cm
  *                        (never before MIN_ALLOW_MS, to stop relay chatter)
  *
@@ -760,8 +761,9 @@ void effectivenessCheckAlert() {
  *   - UNKNOWN TIME FALLS BACK TO NIGHT, so a WiFi or NTP outage cannot quietly
  *     disarm flood protection by leaving us in the restrictive daytime mode.
  *     Pumping at an inconvenient hour is far cheaper than flooding.
- *   - CRITICAL BYPASSES THE REFRACTORY, so a real flood is not locked out for
- *     5 of every 10 minutes.                                                 */
+ *   - EMERGENCY BYPASSES THE REFRACTORY, so a real flood is not locked out for
+ *     5 of every 10 minutes. RAINING does not, or post-flush refill re-arms
+ *     the pump against itself.                                                 */
 const float FAST_RISE_CMPM = 1.0f;
 
 void decideFlush() {
@@ -778,9 +780,25 @@ void decideFlush() {
   if (allowActive) { effectivenessCheckAlert(); return; }
 
   bool inRefractory = (long)(millis() - noRearmUntil) < 0;
-  bool critical     = (level > criticalWaterLevel) || (rise >= FAST_RISE_CMPM);
-  bool blocked      = inRefractory && !critical;
-  bool eligible     = isNight ? (level > waterLevelThreshold) : critical;
+
+  /* EMERGENCY and RAINING are deliberately separate. They used to be one
+   * `critical` flag, and conflating them caused the double flush observed on
+   * 2026-09-17 (18:31:35, then again at 18:37:06):
+   *
+   *   the pump empties the sump to 0 cm -> it refills to 7 cm within five
+   *   minutes -> that is 1.4 cm/min, over FAST_RISE_CMPM -> `critical` ->
+   *   which ALSO bypassed the refractory -> so the pump's own drawdown
+   *   re-armed the pump.
+   *
+   * A full sump genuinely must override the refractory: waiting five minutes
+   * while it overflows is worse than cycling the relay. Rain is only a reason
+   * to relax the DAYTIME restriction, never a reason to disable anti-chatter.
+   * Covered by hosttest/test_decide.cpp. */
+  bool emergency    = (level > criticalWaterLevel);
+  bool raining      = (rise >= FAST_RISE_CMPM) && (level > waterLevelThreshold);
+  bool blocked      = inRefractory && !emergency;
+  bool eligible     = isNight ? (level > waterLevelThreshold)
+                              : (emergency || raining);
 
   /* Startup grace. Before NTP lands, timeOK is false and isNight therefore
    * defaults to true — which is right for flood safety but means the
@@ -813,9 +831,9 @@ void decideFlush() {
   static const char* lastReason = nullptr;
   const char* reason;
   if (!pumpOperationSafe)   reason = "MQTT says unsafe";
-  else if (blocked)         reason = "in 5 min refractory (not critical)";
+  else if (blocked)         reason = "in 5 min refractory (sump not full)";
   else if (!eligible && isNight) reason = "night, but level <= threshold";
-  else if (!eligible)       reason = "day, and not critical";
+  else if (!eligible)       reason = "day, and neither full nor rising";
   else                      reason = "unknown";
 
   if (reason != lastReason) {
